@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"golang.org/x/sync/semaphore"
 )
 
 const (
@@ -34,6 +36,10 @@ const (
 	// If you take a file that is 1300 bytes and compress it to 800 bytes, it’s still transmitted in that same 1500 byte packet regardless, so you’ve gained nothing.
 	// That being the case, you should restrict the gzip compression to files with a size greater than a single packet, 1400 bytes (1.4KB) is a safe value.
 	DefaultMinSize = 1400
+
+	// DefaultLiveWriterLimit is the default limit of gzip writers that can be out at any given time.
+	// Violations of this limit will result in not using gzip to make writes.
+	DefaultLiveWriterLimit = 2 << 16 // 65536
 )
 
 // gzipWriterPools stores a sync.Pool for each compression level for reuse of
@@ -78,6 +84,9 @@ type GzipResponseWriter struct {
 	http.ResponseWriter
 	index int // Index for gzipWriterPools.
 	gw    *gzip.Writer
+
+	sem      *semaphore.Weighted
+	acquired bool
 
 	code int // Saves the WriteHeader value.
 
@@ -131,11 +140,14 @@ func (w *GzipResponseWriter) Write(b []byte) (int, error) {
 				w.Header().Set(contentType, ct)
 			}
 			// If the Content-Type is acceptable to GZIP, initialize the GZIP writer.
-			if handleContentType(w.contentTypes, ct) {
+			if handleContentType(w.contentTypes, ct) && w.sem.TryAcquire(1) {
+				w.acquired = true
 				if err := w.startGzip(); err != nil {
 					return 0, err
 				}
 				return len(b), nil
+			} else {
+				w.ignore = true
 			}
 		}
 	}
@@ -228,6 +240,10 @@ func (w *GzipResponseWriter) Close() error {
 		return nil
 	}
 
+	if w.acquired {
+		w.sem.Release(1)
+	}
+
 	if w.gw == nil {
 		// GZIP not triggered yet, write out regular response.
 		err := w.startPlain()
@@ -307,6 +323,7 @@ func GzipHandlerWithOpts(opts ...option) (func(http.Handler) http.Handler, error
 	c := &config{
 		level:   gzip.DefaultCompression,
 		minSize: DefaultMinSize,
+		limit:   DefaultLiveWriterLimit,
 	}
 
 	for _, o := range opts {
@@ -321,6 +338,7 @@ func GzipHandlerWithOpts(opts ...option) (func(http.Handler) http.Handler, error
 		index := poolIndex(c.level)
 
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			limit := semaphore.NewWeighted(c.limit)
 			w.Header().Add(vary, acceptEncoding)
 			if acceptsGzip(r) {
 				gw := &GzipResponseWriter{
@@ -328,6 +346,7 @@ func GzipHandlerWithOpts(opts ...option) (func(http.Handler) http.Handler, error
 					index:          index,
 					minSize:        c.minSize,
 					contentTypes:   c.contentTypes,
+					sem:            limit,
 				}
 				defer gw.Close()
 
@@ -379,6 +398,7 @@ type config struct {
 	minSize      int
 	level        int
 	contentTypes []parsedContentType
+	limit        int64
 }
 
 func (c *config) validate() error {
@@ -395,12 +415,29 @@ func (c *config) validate() error {
 
 type option func(c *config)
 
+// LimitLiveWriters lets you limit how many gzip writers are live simultaneously.
+//
+// gzip writers are not free to use. They build up intermediate state and that
+// has a cost. When this limit is breached, gzip will not be used.
+func LimitLiveWriters(limit int64) option {
+	return func(c *config) {
+		c.limit = limit
+	}
+}
+
+// MinSize specifies the minimum size that needs to be buffered up before gzip
+// compression is applied to responses.
 func MinSize(size int) option {
 	return func(c *config) {
 		c.minSize = size
 	}
 }
 
+// CompressionLevel lets you set the gzip compression level. Different compression
+// levels have differing CPU and memory tradeoffs per gzip session. See package
+// documentation for compress/gzip[1] for the possible values.
+//
+// [1]: https://pkg.go.dev/compress/gzip?utm_source=godoc#pkg-constants
 func CompressionLevel(level int) option {
 	return func(c *config) {
 		c.level = level
